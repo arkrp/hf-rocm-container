@@ -6,7 +6,8 @@ git checkout rocm_enabled_multi_backend
 # Install dependencies
 pip install -r requirements-dev.txt
 
-# Use -DBNB_ROCM_ARCH to specify target GPU arch
+# IMPORTANT!!!! Use -DBNB_ROCM_ARCH to specify target GPU arch
+# choose the architecture of your GPU!!!!
 cmake -DBNB_ROCM_ARCH="gfx1100" -DCOMPUTE_BACKEND=hip -S .
 
 # Compile the project
