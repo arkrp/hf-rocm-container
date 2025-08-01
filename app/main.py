@@ -17,7 +17,7 @@ from collections import namedtuple
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 # 
 #  config
-ModelConfig = namedtuple('ModelConfig', ['model_id', 'model_dtype', 'tokenizer_chat_template'])
+ModelConfig = namedtuple('ModelConfig', ['model_id', 'model_dtype', 'tokenizer_chat_template', 'stop_sequences'])
 model_config = ModelConfig(
     model_id = "TheBloke/Rose-20B-GPTQ",
     model_dtype = torch.float16,
@@ -31,7 +31,11 @@ model_config = ModelConfig(
         "{{ '### Response:\n' + message['content'] + '\n' }}"
         "{% endif %}"
         "{% endfor %}"
-    )
+        "{% if add_generation_prompt and messages[-1]['role'] != 'assistant' %}"
+        "{{'### Response:'}}"
+        "{% endif %}"
+    ),
+    stop_sequences=['### Instruction:\n']
 )
 DEFAULT_MAX_NEW_TOKENS = 512
 DEFAULT_TEMPERATURE = 0.7
@@ -42,7 +46,6 @@ DEFAULT_REPETITION_PENALTY = 1.1
 #  globals
 tokenizer = None
 model = None
-text_generation_pipeline = None
 # 
 #  init fastapi
 app = FastAPI(
@@ -136,13 +139,6 @@ def initialize_model(model_config: ModelConfig): #  
     model.eval() # Set model to evaluation mode
     # 
     logging.info("Model loaded successfully!")
-    #  make pipeline!
-    text_generation_pipeline = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-    )
-    # 
 # 
 @app.get("/") #  
 async def read_root():
@@ -175,40 +171,36 @@ async def create_chat_completion(request: ChatCompletionRequest):
     Generates text based on the provided messages.
     conforming to the OpenAI Chat Completions API.
     """
-    if not text_generation_pipeline:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Model not loaded. Please wait or check server logs.")
     #  deal with stream requests
     if request.stream:
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Streaming is not yet implemented for this API.")
     # 
     logging.info(f"Received chat completion request. Messages: {request.messages}")
     try:
-        #  apply chat template
-        formatted_prompt = tokenizer.apply_chat_template(
-            request.messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        )
+        #  show formatting
+        #formatted_prompt = tokenizer.apply_chat_template(
+        #    request.messages,
+        #    tokenize=False,
+        #    add_generation_prompt=True,
+        #    return_tensors="pt"
+        #)
+        #print(f'{formatted_prompt=}')
         # 
         #  prepare generation arguments
         generation_args = {
             "max_new_tokens": request.max_tokens,
             "do_sample": True, # Always use sampling for chat models
+            "num_return_sequences": 1,
             "temperature": request.temperature,
-            "top_k": request.top_k,
             "top_p": request.top_p,
-            "repetition_penalty": request.repetition_penalty,
-            "eos_token_id": tokenizer.eos_token_id,
-            "pad_token_id": tokenizer.pad_token_id,
-            "return_full_text": False # Crucial: Only return the newly generated text
         }
         # 
-        #  deal with stop sequences
-        if request.stop:
-            # Hugging Face pipeline expects `stop_sequences` not `stop`
-            # It can be a list of strings
-            generation_args["stop_sequences"] = request.stop if isinstance(request.stop, list) else [request.stop]
+        #  deal with stop sequences (commented out because it crashes the model)
+        #all_stop_sequences = set(model_config.stop_sequences)
+        #if request.stop:
+        #    client_stops = request.stop if isinstance(request.stop, list) else [request.stop]
+        #    all_stop_sequences.update(client_stops)
+        #generation_args['stop_sequences'] = list(all_stop_sequences)
         # 
         #  set seed if needed!
         if request.seed is not None:
@@ -216,15 +208,26 @@ async def create_chat_completion(request: ChatCompletionRequest):
         # 
         #  run the pipeline!
         with torch.no_grad():
-            outputs = text_generation_pipeline(
-                formatted_prompt,
+            tokenized_prompt = tokenizer.apply_chat_template(
+                request.messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_tensors="pt"
+            ).to("cuda")
+            output = model.generate(
+                tokenized_prompt,
                 **generation_args
             )
-        generated_text = outputs[0]["generated_text"].strip()
+            prompt_length = tokenized_prompt.shape[1]
+            newly_generated_tokens = output[0][prompt_length:]
+            decoded_output = tokenizer.decode(newly_generated_tokens, skip_special_tokens=True)
+        # 
+        #  clean up response
+        generated_text = decoded_output.strip()
         # 
         logging.info(f"Generated response (first 50 chars): '{generated_text[:50]}...'")
-        #  calculate token usage
-        prompt_tokens = len(tokenizer.encode(formatted_prompt))
+        #  compute token usage
+        prompt_tokens = prompt_length
         completion_tokens = len(tokenizer.encode(generated_text))
         total_tokens = prompt_tokens + completion_tokens
         # 
