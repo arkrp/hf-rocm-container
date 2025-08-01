@@ -4,14 +4,18 @@ import argparse
 import os
 import time
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline, TextIteratorStreamer
 from huggingface_hub import login
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import uvicorn
 import logging
 from typing import List, Optional, Union, Dict, Any
 from collections import namedtuple
+from threading import Thread
+import json
+import itertools
 # 
 #  logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,7 +36,7 @@ model_config = ModelConfig(
         "{% endif %}"
         "{% endfor %}"
         "{% if add_generation_prompt and messages[-1]['role'] != 'assistant' %}"
-        "{{'### Response:'}}"
+        "{{'### Response:\n\n'}}"
         "{% endif %}"
     ),
     stop_sequences=['### Instruction:\n']
@@ -145,7 +149,7 @@ async def read_root():
     """
     A simple health check endpoint.
     """
-    return {"message": f"{model_id} is running. Check /docs for API documentation."}
+    return {"message": f"{model_config.model_id} is running. Check /docs for API documentation."}
 # 
 @app.get("/v1/models", response_model=ModelsListResponse) #  
 async def list_models():
@@ -158,7 +162,7 @@ async def list_models():
     # In this single-model server, we return details for the loaded model.
     # The 'owned_by' field is set to 'user' as it's a local/self-hosted model.
     gemma_model_info = Model(
-        id=model_id,
+        id=model_config.model_id,
         object="model",
         created=current_timestamp, # Use current time as creation timestamp for simplicity
         owned_by="user id not implemented"
@@ -171,10 +175,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
     Generates text based on the provided messages.
     conforming to the OpenAI Chat Completions API.
     """
-    #  deal with stream requests
-    if request.stream:
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Streaming is not yet implemented for this API.")
-    # 
     logging.info(f"Received chat completion request. Messages: {request.messages}")
     try:
         #  show formatting
@@ -206,7 +206,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
         if request.seed is not None:
             torch.manual_seed(request.seed) # Set PyTorch seed for reproducibility
         # 
-        #  run the pipeline!
+        #  tokenize!!
         with torch.no_grad():
             tokenized_prompt = tokenizer.apply_chat_template(
                 request.messages,
@@ -214,50 +214,122 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 add_generation_prompt=True,
                 return_tensors="pt"
             ).to("cuda")
-            output = model.generate(
-                tokenized_prompt,
-                **generation_args
-            )
-            prompt_length = tokenized_prompt.shape[1]
-            newly_generated_tokens = output[0][prompt_length:]
-            decoded_output = tokenizer.decode(newly_generated_tokens, skip_special_tokens=True)
+        prompt_tokens = tokenized_prompt.shape[1]
         # 
-        #  clean up response
-        generated_text = decoded_output.strip()
-        # 
-        logging.info(f"Generated response (first 50 chars): '{generated_text[:50]}...'")
-        #  compute token usage
-        prompt_tokens = prompt_length
-        completion_tokens = len(tokenizer.encode(generated_text))
-        total_tokens = prompt_tokens + completion_tokens
-        # 
-        #  format response
-        response_data = ChatCompletionResponse(
-            id=f"chatcmpl-{os.urandom(12).hex()}", # Unique ID
-            object="chat.completion",
-            created=int(time.time()), # Current Unix timestamp
-            model=model_config.model_id,
-            choices=[
-                ChatCompletionChoice(
-                    index=0,
-                    message=ChatCompletionChoiceMessage(
-                        role="assistant",
-                        content=generated_text,
-                    ),
-                    finish_reason="stop", # Assuming 'stop' for now; can be refined
+        if not request.stream:
+            #  generate!
+            with torch.no_grad():
+                output = model.generate(
+                    tokenized_prompt,
+                    **generation_args
                 )
-            ],
-            usage=ChatCompletionUsage(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
+            # 
+            #  decode!
+            newly_generated_tokens = output[0][prompt_tokens:]
+            decoded_output = tokenizer.decode(newly_generated_tokens, skip_special_tokens=True)
+            # 
+            #  clean up response
+            generated_text = decoded_output.strip()
+            # 
+            #  compute token usage
+            completion_tokens = len(tokenizer.encode(generated_text))
+            total_tokens = prompt_tokens + completion_tokens
+            # 
+            #  format response
+            response_data = ChatCompletionResponse(
+                id=f"chatcmpl-{os.urandom(12).hex()}", # Unique ID
+                object="chat.completion",
+                created=int(time.time()), # Current Unix timestamp
+                model=model_config.model_id,
+                choices=[
+                    ChatCompletionChoice(
+                        index=0,
+                        message=ChatCompletionChoiceMessage(
+                            role="assistant",
+                            content=generated_text,
+                        ),
+                        finish_reason="stop", # Assuming 'stop' for now; can be refined
+                    )
+                ],
+                usage=ChatCompletionUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                )
             )
-        )
-        # 
-        return response_data
+            # 
+            return response_data
+        else: # request.stream == True
+            streamer = TextIteratorStreamer(tokenizer, skip_special_tokens=True, skip_prompt=True)
+            #  update generation args
+            generation_args['streamer'] = streamer
+            # 
+            thread = Thread(target=model.generate, kwargs={
+                        'input_ids': tokenized_prompt,
+                        **generation_args
+                    })
+            thread.start()
+
+            # The generator function that will stream the output
+            async def generate_and_stream():
+                try:
+                    # This loop will run as new tokens become available in the streamer
+                    for new_text in streamer:
+                        # Format each chunk as an OpenAI-compatible streaming response
+                        chunk_id = f"chatcmpl-{os.urandom(12).hex()}"
+                        chunk_created = int(time.time())
+                        
+                        # Create a simple, compatible streaming chunk
+                        chunk_data = {
+                            "id": chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": chunk_created,
+                            "model": "TheBloke/Rose-20B-GPTQ",
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "content": new_text
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ]
+                        }
+
+                        # Yield the data in the Server-Sent Events (SSE) format
+                        yield f"data: {json.dumps(chunk_data)}\n\n"
+                        
+                    # After the loop, the generation is complete.
+                    # Send a final chunk with the finish reason.
+                    final_chunk = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": chunk_created,
+                        "model": "TheBloke/Rose-20B-GPTQ",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop" # Assuming stop for now, can be refined later
+                            }
+                        ]
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    
+                    # Signal the end of the stream with a final message
+                    yield "data: [DONE]\n\n"
+                    
+                finally:
+                    # Ensure the generation thread is properly joined
+                    thread.join()
+
+            # Return the StreamingResponse with our generator
+            return StreamingResponse(generate_and_stream(), media_type="text/event-stream")
     except Exception as e:
         logging.error(f"Error during text generation: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal server error: {e}")
+             
+
 # 
 def main(): #  
     #  parse arguments
