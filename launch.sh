@@ -7,4 +7,4 @@ sudo docker run -it --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 --ipc=host --shm-size 8G \
 -v $HF_HOME:/mnt/HF_HOME -e HF_HOME=/mnt/HF_HOME -e HF_TOKEN=$HF_TOKEN \
 -p 8000:8000 \
-$application_name
+$application_name $1

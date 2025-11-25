@@ -9,6 +9,7 @@ from huggingface_hub import login
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from gptqmodel import exllama_set_max_input_length
 import uvicorn
 import logging
 from typing import List, Optional, Union, Dict, Any
@@ -140,6 +141,7 @@ def initialize_model(model_config: ModelConfig): #  
         torch_dtype=model_config.model_dtype,
         trust_remote_code=True
     )
+    model = exllama_set_max_input_length(model, max_input_length=20000)
     model.eval() # Set model to evaluation mode
     # 
     logging.info("Model loaded successfully!")
@@ -194,6 +196,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
             "temperature": request.temperature,
             "top_p": request.top_p,
         }
+        #  only sample when appropriate
+        if request.temperature==0.0:
+            generation_args['do_sample'] = False
+        # 
         # 
         #  deal with stop sequences (commented out because it crashes the model)
         #all_stop_sequences = set(model_config.stop_sequences)
